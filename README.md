@@ -38,7 +38,7 @@ Requires git 2.23 or newer and [Babashka](https://babashka.org).
 With [bbin](https://github.com/babashka/bbin):
 
 ```bash
-bbin install https://github.com/Cyrik/git-snapshot
+bbin install https://github.com/Cyrik/git-snapshot.git
 ```
 
 Or by hand: copy `git-snapshot` somewhere on your `PATH` and make it
