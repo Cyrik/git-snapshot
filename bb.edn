@@ -1,0 +1,4 @@
+{:bbin/bin {git-snapshot {:main-opts ["-f" "git-snapshot"]}}
+ :tasks
+ {test {:doc "Run the test suite against throwaway repos"
+        :task (shell "bb" "test/git_snapshot_test.clj")}}}
