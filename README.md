@@ -109,9 +109,9 @@ git snapshot prune --dry-run   # show what would go
 git snapshot prune
 ```
 
-`git snapshot` prints a one-line hint on stderr when there is something to
-prune, so the listing itself stays parseable. Deleted refs have no reflog, so
-the commits become collectable by the next `git gc` once its expiry passes.
+Nothing reminds you to prune; run it when the list gets long. Deleted refs
+have no reflog, so the commits become collectable by the next `git gc` once
+its expiry passes.
 
 ## For AI agents
 

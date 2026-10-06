@@ -81,9 +81,6 @@
 (defn dry-run [repo]
   (with-out-str (git-snapshot/prune repo true)))
 
-(defn list-hint [repo]
-  (with-err-str #(quiet (fn [] (git-snapshot/list-snapshots repo)))))
-
 (deftest save-captures-worktree-under-branch-without-touching-index
   (let [repo (temp-repo)]
     (dirty-worktree! repo)
@@ -194,10 +191,9 @@
       (is (str/starts-with? current "f1\t"))
       (is (not (str/includes? current "s1")))
       (is (not (str/includes? current "legacy")))
-      (is (not (str/includes? current "prune")) "the hint goes to stderr, not into the listing")
       (is (= ["[feature/x]" "f1" "[main]" "s1" "[no branch]" "legacy"]
              (map #(first (str/split % #"\t")) (str/split-lines all)))))
-    (is (= "1 snapshot on finished branches: git snapshot prune" (str/trim (list-hint repo)))
+    (is (= "would delete 1 under [no branch]" (str/trim (dry-run repo)))
         "only the legacy ref is prunable: feature/x is checked out, main is the default")
     (is (= "refs/snapshots/legacy" (ref-of repo "legacy")) "flat refs resolve by full path")
     (is (= "refs/snapshots/main/s1" (ref-of repo "main/s1")) "other branches resolve by full path")
@@ -423,7 +419,7 @@
       (is (str/includes? dry "would delete 2 under [no branch]") "deleted branch + legacy ref")
       (doseq [kept ["feature/live" "feature/pushed" "feature/parked" "feature/fresh" "[main]"]]
         (is (not (str/includes? dry kept)) kept))
-      (is (= "4 snapshots on finished branches: git snapshot prune" (str/trim (list-hint repo)))))
+)
     (quiet #(git-snapshot/prune repo false))
     (is (= #{"main/main-s1" "feature/pushed/s1" "feature/live/s1" "feature/parked/s1" "feature/fresh/s1"}
            (all-snapshot-refs repo)))
@@ -431,7 +427,6 @@
     (is (= "deleted 1 under [feature/parked]" (str/trim (with-out-str (git-snapshot/prune repo false))))
         "once the worktree is gone the merged branch is finished")
     (is (= "nothing to prune" (str/trim (with-out-str (git-snapshot/prune repo false)))))
-    (is (str/blank? (list-hint repo)) "hint gone")
     (fs/delete-tree wt-parent)
     (fs/delete-tree repo)))
 
@@ -442,7 +437,6 @@
     (spit (fs/file repo "a.txt") "a\n")
     (quiet #(git-snapshot/save repo "baseline" nil))
     (is (= "nothing to prune" (str/trim (dry-run repo))) "unborn main is checked out")
-    (is (str/blank? (list-hint repo)))
     (git repo "add" "a.txt")
     (git repo "commit" "-q" "-m" "init")
     (git repo "checkout" "-q" "--detach")
@@ -481,7 +475,7 @@
     (is (= "refs/remotes/origin/main" (git-snapshot/default-branch-ref repo)))
     (git repo "symbolic-ref" "refs/remotes/origin/HEAD" "refs/remotes/origin/renamed-away")
     (is (= "refs/heads/main" (git-snapshot/default-branch-ref repo)) "dangling origin/HEAD is ignored")
-    (is (str/blank? (with-err-str #(quiet (fn [] (git-snapshot/list-snapshots repo))))) "and nothing is printed to stderr")
+    (is (str/blank? (with-err-str #(quiet (fn [] (git-snapshot/prune repo true))))) "and nothing is printed to stderr")
     (fs/delete-tree repo)))
 
 (deftest flags-are-parsed-only-before-the-name
