@@ -1,11 +1,12 @@
 (ns git-snapshot-test
   (:require [babashka.fs :as fs]
+            [babashka.process :as p]
             [clojure.string :as str]
             [clojure.test :refer [deftest is run-tests]]))
 
-(load-file
- (str (fs/normalize
-       (fs/path (fs/parent *file*) ".." "git-snapshot"))))
+(def script (str (fs/normalize (fs/path (fs/parent *file*) ".." "git-snapshot"))))
+
+(load-file script)
 
 (def git git-snapshot/git)
 
@@ -84,7 +85,9 @@
 (deftest save-captures-worktree-under-branch-without-touching-index
   (let [repo (temp-repo)]
     (dirty-worktree! repo)
+    (git repo "add" "a.txt")
     (let [status-before (git repo "status" "--porcelain")
+          index-before (git repo "ls-files" "-s")
           sha (quiet #(git-snapshot/save repo "s1" nil))]
       (is (= "refs/snapshots/main/s1" (ref-of repo "s1")))
       (is (= sha (:sha (git-snapshot/resolve-snapshot repo "s1"))))
@@ -93,6 +96,7 @@
           "untracked included, deleted and ignored files excluded")
       (is (= "a\nb" (git repo "show" "refs/snapshots/main/s1:a.txt")))
       (is (= status-before (git repo "status" "--porcelain")) "index and worktree untouched")
+      (is (= index-before (git repo "ls-files" "-s")) "staged entry still staged")
       (is (= "main" (git repo "rev-parse" "--abbrev-ref" "HEAD")))
       (is (str/blank? (git repo "branch" "--list" "*s1*")) "not a branch"))
     (let [replaced (with-out-str (git-snapshot/save repo "s1" "again"))]
@@ -315,8 +319,9 @@
 
 (deftest unknown-snapshot-fails-with-exit-code
   (let [repo (temp-repo)]
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no snapshot named nope"
-                          (git-snapshot/replay repo "nope")))
+    (let [e (try (git-snapshot/replay repo "nope") (catch clojure.lang.ExceptionInfo e e))]
+      (is (re-find #"no snapshot named nope" (ex-message e)))
+      (is (= 1 (:babashka/exit (ex-data e))) "exit status rides in ex-data for bb"))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no snapshot named nope"
                           (git-snapshot/delete repo "nope")))
     (is (empty? (branch-names repo)) "failed replay leaves no pre-replay snapshot")
@@ -488,6 +493,92 @@
   (is (= {:flags #{} :command "save" :name "s1" :message ["-n" "see" "--help"]}
          (git-snapshot/parse-args ["save" "s1" "-n" "see" "--help"]))
       "message text keeps words that look like flags"))
+
+(deftest replay-backs-up-untracked-files-hidden-from-status
+  ;; Every file replay deletes must be in the pre-replay backup, even when the
+  ;; repo's config tells `git status` not to mention untracked files.
+  (let [repo (temp-repo)]
+    (quiet #(git-snapshot/save repo "s1" nil))
+    (git repo "config" "status.showUntrackedFiles" "no")
+    (spit (fs/file repo "precious.txt") "keep\n")
+    (quiet #(git-snapshot/replay repo "s1"))
+    (is (not (fs/exists? (fs/file repo "precious.txt"))) "stray is removed")
+    (let [[backup :as backups] (filter git-snapshot/backup-name? (branch-names repo))]
+      (is (= 1 (count backups)) "backup taken although status hid the file")
+      (is (contains? (snapshot-files repo backup) "precious.txt")))
+    (fs/delete-tree repo)))
+
+(deftest replay-spares-files-ignored-under-current-rules
+  ;; The snapshot predates an ignore rule. Replay restores the old .gitignore,
+  ;; but the file ignored today was never backed up, so it must survive.
+  (let [repo (temp-repo)]
+    (quiet #(git-snapshot/save repo "s1" nil))
+    (commit-file! repo ".gitignore" "*.log\nsecrets.local\n" "ignore secrets")
+    (spit (fs/file repo "secrets.local") "hunter2\n")
+    (is (not (git-snapshot/dirty? repo)))
+    (quiet #(git-snapshot/replay repo "s1"))
+    (is (= "*.log\n" (slurp (fs/file repo ".gitignore"))) "snapshot's .gitignore restored")
+    (is (fs/exists? (fs/file repo "secrets.local")) "file ignored at replay time is not deleted")
+    (is (= ["s1"] (branch-names repo)) "clean tree, so no backup")
+    (fs/delete-tree repo)))
+
+(deftest replay-removes-padded-names-and-leaves-nested-repos-alone
+  (let [repo (temp-repo)]
+    (quiet #(git-snapshot/save repo "s1" nil))
+    (spit (fs/file repo " padded.txt") "x\n")
+    (let [nested (str (fs/path repo "nested"))]
+      (git repo "init" "-q" "-b" "main" nested)
+      (configure-user! nested)
+      (commit-file! nested "x.txt" "x\n" "nested"))
+    (git repo "config" "advice.addEmbeddedRepo" "false")
+    (quiet #(git-snapshot/replay repo "s1"))
+    (is (not (fs/exists? (fs/file repo " padded.txt"))) "name with a leading space is deleted")
+    (is (fs/exists? (fs/file repo "nested" ".git")) "nested repository untouched")
+    (fs/delete-tree repo)))
+
+(deftest tag-named-like-the-branch-does-not-move-the-namespace
+  (let [repo (temp-repo)]
+    (git repo "checkout" "-q" "-b" "release")
+    (git repo "tag" "release")
+    (is (= "release" (git-snapshot/current-branch repo)))
+    (spit (fs/file repo "r.txt") "r\n")
+    (quiet #(git-snapshot/save repo "s1" nil))
+    (is (= "refs/snapshots/release/s1" (ref-of repo "s1")))
+    (is (str/includes? (dry-run repo) "nothing to prune") "checked-out branch stays protected")
+    (fs/delete-tree repo)))
+
+(deftest snapshots-of-a-deleted-longer-branch-stay-off-a-prefix-branch
+  ;; feat/x's snapshots live under refs/snapshots/feat/x/. Once feat/x is gone
+  ;; and a branch named feat appears, they must not read as feat's.
+  (let [repo (temp-repo)]
+    (git repo "checkout" "-q" "-b" "feat/x")
+    (spit (fs/file repo "x.txt") "x\n")
+    (quiet #(git-snapshot/save repo "s1" nil))
+    (git repo "checkout" "-q" "main")
+    (git repo "branch" "-q" "-D" "feat/x")
+    (git repo "checkout" "-q" "-b" "feat")
+    (is (empty? (branch-names repo)) "feat lists nothing")
+    (quiet #(git-snapshot/save repo "mine" nil))
+    (is (= (git repo "rev-parse" "HEAD") (parent-of repo "mine")) "chains to HEAD, not to feat/x/s1")
+    (is (str/includes? (with-out-str (git-snapshot/list-all-snapshots repo)) "[no branch]\nfeat/x/s1"))
+    (is (str/includes? (dry-run repo) "would delete 1 under [no branch]"))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"cannot contain /"
+                          (git-snapshot/save repo "a/b" nil)))
+    (fs/delete-tree repo)))
+
+(deftest git-failures-exit-without-a-stack-trace
+  (let [repo (temp-repo)
+        run (fn [dir & args]
+              (apply p/shell {:dir dir :out :string :err :string :continue true} "bb" script args))
+        bad-name (run repo "save" "bad name")
+        outside (run (str (fs/create-temp-dir)) "list")]
+    (is (= 1 (:exit bad-name)))
+    (is (str/includes? (:err bad-name) "bad name") "git's own message is shown")
+    (is (not (str/includes? (:err bad-name) "----- Error")) "no Babashka error report")
+    (is (= 1 (:exit outside)))
+    (is (str/includes? (:err outside) "not a git repository"))
+    (is (not (str/includes? (:err outside) "----- Error")))
+    (fs/delete-tree repo)))
 
 (let [{:keys [fail error]} (run-tests)]
   (System/exit (if (zero? (+ fail error)) 0 1)))

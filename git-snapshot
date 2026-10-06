@@ -34,8 +34,6 @@
 
 (def known-flags #{"--all" "--dry-run" "-n" "-h" "--help"})
 
-(def nul-separator (re-pattern (str (char 0))))
-
 (defn fail [message]
   (throw (ex-info message {:babashka/exit 1})))
 
@@ -48,16 +46,22 @@
   (remove str/blank? (str/split-lines (apply git repo args))))
 
 (defn git-nul-list
-  "Run a git command with NUL-separated output and return its entries."
+  "Run a git command with NUL-separated output and return its entries
+  untrimmed, since a file name may begin or end with whitespace."
   [repo & args]
-  (remove str/blank? (str/split (apply git repo args) nul-separator)))
+  (remove empty? (str/split (:out (apply p/shell {:dir repo :out :string} "git" args)) #"\u0000")))
+
+(defn branch-name [ref]
+  (str/replace ref #"^refs/(heads|remotes/[^/]+)/" ""))
 
 (defn current-branch
-  "Checked-out branch, or \"detached\" when HEAD is not on a branch."
+  "Checked-out branch, or \"detached\" when HEAD is not on a branch. Taken
+  from the full ref, as `checked-out-branches` does, because `--short` reports
+  `heads/x` instead of `x` when a tag is also named x."
   [repo]
   (let [{:keys [exit out]} (p/shell {:dir repo :out :string :continue true}
-                                    "git" "symbolic-ref" "--short" "-q" "HEAD")]
-    (if (zero? exit) (str/trim out) "detached")))
+                                    "git" "symbolic-ref" "-q" "HEAD")]
+    (if (zero? exit) (branch-name (str/trim out)) "detached")))
 
 (defn branch-prefix [repo]
   (str ref-prefix (current-branch repo) "/"))
@@ -106,11 +110,19 @@
         parents (set (map :parent chained))]
     (first (remove #(parents (:sha %)) chained))))
 
+(defn branch-entries
+  "Snapshots of the branch whose prefix this is: the refs directly under it.
+  Refs nested deeper, such as feat/x/s1 under feat/, belong to a branch whose
+  name extends this one, possibly one that no longer exists."
+  [repo prefix]
+  (remove #(str/includes? (display-name (:ref %) prefix) "/")
+          (snapshot-entries repo prefix)))
+
 (defn chain-parent
   "Snapshot the next save on the current branch should chain to, or nil."
   [repo]
   (let [prefix (branch-prefix repo)]
-    (chain-tip (snapshot-entries repo prefix) prefix)))
+    (chain-tip (branch-entries repo prefix) prefix)))
 
 (defn excluded-untracked
   "Untracked files matching the pathspecs in the multi-valued git config
@@ -163,8 +175,11 @@
   "Store the working tree as refs/snapshots/<branch>/<name> and return the
   commit sha. The parent is the branch's newest snapshot, else HEAD; backups
   always hang off HEAD. On an unborn branch (no commits yet) the first snapshot
-  has no parent. An existing snapshot of the same name is replaced."
+  has no parent. An existing snapshot of the same name is replaced. Names
+  cannot contain `/`, which separates the branch from the name in the ref."
   [repo name message]
+  (when (str/includes? name "/")
+    (fail (str "snapshot names cannot contain /: " name)))
   (let [prefix (branch-prefix repo)
         ref (str prefix name)
         previous (resolve-ref repo ref)
@@ -196,15 +211,11 @@
     (sort-by #(get order (:sha %) Long/MAX_VALUE) entries)))
 
 (defn snapshot-branch
-  "Branch a snapshot ref belongs to: the longest name in `branches` that
-  prefixes its path, or nil for refs saved before branch namespacing or whose
-  branch is gone."
+  "Branch a snapshot ref belongs to: its path minus the snapshot name, when
+  that is one of `branches`. nil for refs saved before branch namespacing or
+  whose branch is gone."
   [branches ref]
-  (let [segments (str/split (display-name ref ref-prefix) #"/")]
-    (->> (range (dec (count segments)) 0 -1)
-         (map #(str/join "/" (take % segments)))
-         (filter branches)
-         first)))
+  (branches (str/join "/" (butlast (str/split (display-name ref ref-prefix) #"/")))))
 
 (defn snapshot-groups
   "All snapshots grouped by branch as [branch entries] pairs, sorted by branch
@@ -212,9 +223,6 @@
   [repo branches]
   (sort-by (fn [[branch]] [(nil? branch) (or branch "")])
            (group-by #(snapshot-branch branches (:ref %)) (snapshot-entries repo ref-prefix))))
-
-(defn branch-name [ref]
-  (str/replace ref #"^refs/(heads|remotes/[^/]+)/" ""))
 
 (defn default-branch-ref
   "The default branch as a full ref: origin/HEAD's target when it resolves,
@@ -297,7 +305,7 @@
   "Snapshots on the current branch."
   [repo]
   (let [prefix (branch-prefix repo)]
-    (print-entries (chain-ordered repo (snapshot-entries repo prefix) prefix) prefix))
+    (print-entries (chain-ordered repo (branch-entries repo prefix) prefix) prefix))
   (flush))
 
 (defn list-all-snapshots
@@ -325,21 +333,34 @@
             (git repo "update-ref" "-d" ref)))))
     (flush)))
 
-(defn dirty? [repo]
-  (not (str/blank? (git repo "status" "--porcelain"))))
+(defn dirty?
+  "Whether the working tree differs from HEAD or holds untracked files. Asks
+  for untracked files explicitly so `status.showUntrackedFiles=no` cannot
+  hide them."
+  [repo]
+  (not (str/blank? (git repo "status" "--porcelain" "--untracked-files=normal"))))
 
 (defn timestamp []
   (.format (LocalDateTime/now) (DateTimeFormatter/ofPattern "yyyyMMdd-HHmmss")))
 
+(defn untracked-files
+  "Untracked, non-ignored files under the ignore rules currently in the
+  working tree. A nested repository shows up as `dir/` and is left out."
+  [repo]
+  (remove #(str/ends-with? % "/")
+          (git-nul-list repo "ls-files" "--others" "--exclude-standard" "-z")))
+
 (defn stray-untracked
-  "Untracked, non-ignored files in the working tree that the snapshot does not
-  contain, minus `snapshot.exclude` matches. `git restore` never removes
-  untracked files, so replay deletes these itself to make the working tree
-  match the snapshot."
+  "Untracked files the snapshot does not contain, minus `snapshot.exclude`
+  matches. `git restore` never removes untracked files, so replay deletes
+  these itself to make the working tree match the snapshot. Must run before
+  the restore: afterwards the snapshot's ignore rules are in effect, and a
+  file they do not ignore could be deleted without the backup, taken under
+  the current rules, having captured it."
   [repo ref]
   (let [keep (into (set (git-nul-list repo "ls-tree" "-r" "--name-only" "-z" ref))
                    (excluded-untracked repo))]
-    (remove keep (git-nul-list repo "ls-files" "--others" "--exclude-standard" "-z"))))
+    (remove keep (untracked-files repo))))
 
 (defn unique-name
   "`base`, or the first `base-N` (N from 2) not already taken by a snapshot."
@@ -352,17 +373,19 @@
   "Make the working tree match a snapshot without touching the index, so the
   snapshot's changes appear as unstaged modifications and untracked files.
   Skip-worktree files keep their working copy. A dirty working tree is saved
-  first as pre-replay-<timestamp>."
+  first as pre-replay-<timestamp>, and every file replay deletes is in that
+  backup."
   [repo name]
   (let [{:keys [ref]} (or (resolve-snapshot repo name)
-                          (fail (str "no snapshot named " name)))]
+                          (fail (str "no snapshot named " name)))
+        strays (stray-untracked repo ref)]
     (when (dirty? repo)
       (let [backup (unique-name repo (str backup-prefix (timestamp)))]
         (save repo backup (str "working tree before replaying " name))
         (println "saved current working tree as" backup)))
     (apply git repo "restore" "--source" ref "--worktree" "--" ":/"
            (map #(str ":(exclude,literal)" %) (skip-worktree-paths repo)))
-    (doseq [file (stray-untracked repo ref)]
+    (doseq [file strays]
       (fs/delete (fs/path repo file)))
     (print (:out (p/shell {:dir repo :out :string} "git" "status" "--short")))
     (flush)))
@@ -398,4 +421,9 @@
       :else (fail usage))))
 
 (when (= *file* (System/getProperty "babashka.file"))
-  (-main *command-line-args*))
+  (try (-main *command-line-args*)
+       (catch clojure.lang.ExceptionInfo e
+         ;; git has already written its own message to stderr.
+         (if (= :babashka.process/error (:type (ex-data e)))
+           (System/exit 1)
+           (throw e)))))

@@ -56,7 +56,8 @@ git snapshot prune [--dry-run]        delete the snapshots of finished branches
 
 Names resolve on the current branch first, then as a full path under
 `refs/snapshots/` (`main/step-2`, or another branch's snapshot). Saving over an
-existing name replaces it and prints the old sha.
+existing name replaces it and prints the old sha. Names cannot contain `/`;
+the path before the name is the branch.
 
 ## Replay
 
@@ -64,7 +65,9 @@ existing name replaces it and prints the old sha.
 untracked files the snapshot does not contain. The index is never touched, so
 the snapshot's changes appear as unstaged modifications and untracked files,
 which is what a diff viewer wants. If the working tree is dirty, it is saved
-first as `pre-replay-<timestamp>`; replay that name to get back. Backups hang
+first as `pre-replay-<timestamp>`; replay that name to get back. Replay decides
+what to delete before it touches anything, under the ignore rules in effect at
+that moment, so everything it deletes is in that backup. Backups hang
 off HEAD instead of joining the chain, so `git log` still reads as the real
 steps.
 
@@ -142,6 +145,8 @@ anyone committing.
   later snapshots in the chain, so `git log` through the chain keeps working.
   Objects become collectable once nothing references them.
 - Works on a repo with no commits yet: the first snapshot has no parent.
+- When git refuses something, you see git's message and the command exits 1,
+  with no stack trace.
 - Not a filesystem backup. Empty directories, ignored files, and permissions
   beyond the executable bit are not captured.
 
