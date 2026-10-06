@@ -183,8 +183,10 @@
       (is (str/starts-with? current "f1\t"))
       (is (not (str/includes? current "s1")))
       (is (not (str/includes? current "legacy")))
-      (is (= ["[feature/x]" "f1" "[main]" "s1" "[no branch]" "legacy"]
-             (map #(first (str/split % #"\t")) (str/split-lines all)))))
+      (is (= ["[feature/x]" "f1" "[main]" "s1" "[no branch]" "legacy"
+              "1 snapshot on finished branches: git snapshot prune"]
+             (map #(first (str/split % #"\t")) (str/split-lines all)))
+          "feature/x has no commits of its own yet, so only the legacy ref is prunable"))
     (is (= "refs/snapshots/legacy" (ref-of repo "legacy")) "flat refs resolve by full path")
     (is (= "refs/snapshots/main/s1" (ref-of repo "main/s1")) "other branches resolve by full path")
     (fs/delete-tree repo)))
@@ -303,6 +305,83 @@
       (is (nil? (git-snapshot/resolve-snapshot repo "s1")))
       (is (= s1 (parent-of repo "s2")) "s1's commit is still s2's parent")
       (is (= ["second" "first" "init"] (str/split-lines (git repo "log" "--format=%s" (ref-of repo "s2"))))))
+    (fs/delete-tree repo)))
+
+(defn commit-file! [repo path content message]
+  (spit (fs/file repo path) content)
+  (git repo "add" path)
+  (git repo "commit" "-q" "-m" message))
+
+
+(deftest prune-removes-snapshots-of-finished-branches-only
+  (let [repo (temp-repo)
+        wt (str (fs/path (fs/create-temp-dir) "parked-wt"))
+        all-refs #(set (git-snapshot/git-lines repo "for-each-ref" "--format=%(refname:lstrip=2)" "refs/snapshots/"))]
+    ;; main: the default branch, its snapshots must survive even though main
+    ;; is trivially an ancestor of itself.
+    (spit (fs/file repo "a.txt") "a\nb\n")
+    (quiet #(git-snapshot/save repo "main-s1" nil))
+    (git repo "checkout" "--" ".")
+    ;; feature/merged: committed, snapshotted, merged back into main, main moved on.
+    (git repo "checkout" "-q" "-b" "feature/merged")
+    (commit-file! repo "merged.txt" "m\n" "merged work")
+    (spit (fs/file repo "merged.txt") "m\nmore\n")
+    (quiet #(git-snapshot/save repo "s1" nil))
+    (git repo "checkout" "--" ".")
+    (git repo "checkout" "-q" "main")
+    (git repo "merge" "-q" "feature/merged")
+    (commit-file! repo "after.txt" "x\n" "main moves on")
+    ;; feature/deleted: snapshotted, then the branch is deleted.
+    (git repo "checkout" "-q" "-b" "feature/deleted")
+    (spit (fs/file repo "d.txt") "d\n")
+    (quiet #(git-snapshot/save repo "s1" nil))
+    (fs/delete (fs/file repo "d.txt"))
+    (git repo "checkout" "-q" "main")
+    (git repo "branch" "-D" "feature/deleted")
+    ;; feature/squash: unmerged commit, but its upstream is gone.
+    (git repo "checkout" "-q" "-b" "feature/squash")
+    (commit-file! repo "sq.txt" "s\n" "squash work")
+    (quiet #(git-snapshot/save repo "s1" nil))
+    (git repo "config" "branch.feature/squash.remote" "origin")
+    (git repo "config" "branch.feature/squash.merge" "refs/heads/feature/squash")
+    (git repo "checkout" "-q" "main")
+    ;; feature/live: unmerged, no upstream, must survive.
+    (git repo "checkout" "-q" "-b" "feature/live")
+    (commit-file! repo "live.txt" "l\n" "live work")
+    (spit (fs/file repo "live.txt") "l\nmore\n")
+    (quiet #(git-snapshot/save repo "s1" nil))
+    (git repo "checkout" "--" ".")
+    (git repo "checkout" "-q" "main")
+    ;; feature/parked: merged, but still checked out in a worktree, so protected
+    ;; until that worktree goes. Its snapshot is taken from inside the worktree.
+    (git repo "checkout" "-q" "-b" "feature/parked")
+    (commit-file! repo "parked.txt" "p\n" "parked work")
+    (git repo "checkout" "-q" "main")
+    (git repo "merge" "-q" "feature/parked")
+    (commit-file! repo "after2.txt" "y\n" "main moves on again")
+    (git repo "worktree" "add" "-q" wt "feature/parked")
+    (spit (fs/file wt "parked.txt") "p\nmore\n")
+    (quiet #(git-snapshot/save wt "s1" nil))
+    ;; a ref from before branch namespacing
+    (git repo "update-ref" "refs/snapshots/legacy" (:sha (git-snapshot/resolve-snapshot repo "main-s1")))
+    (let [before (all-refs)
+          dry (with-out-str (git-snapshot/prune repo true))]
+      (is (= before (all-refs)) "dry run deletes nothing")
+      (is (str/includes? dry "would delete 1 under [feature/merged]"))
+      (is (str/includes? dry "would delete 1 under [feature/squash]"))
+      (is (str/includes? dry "would delete 2 under [no branch]") "deleted branch + legacy ref")
+      (is (not (str/includes? dry "feature/live")))
+      (is (not (str/includes? dry "feature/parked")) "checked out in a worktree")
+      (is (not (str/includes? dry "[main]")))
+      (is (str/includes? (with-out-str (git-snapshot/list-snapshots repo)) "4 snapshots on finished branches")))
+    (quiet #(git-snapshot/prune repo false))
+    (is (= #{"main/main-s1" "feature/live/s1" "feature/parked/s1"} (all-refs)))
+    (git repo "worktree" "remove" "--force" wt)
+    (is (= "deleted 1 under [feature/parked]" (str/trim (with-out-str (git-snapshot/prune repo false))))
+        "once the worktree is gone the merged branch is finished")
+    (is (= #{"main/main-s1" "feature/live/s1"} (all-refs)))
+    (is (= "nothing to prune" (str/trim (with-out-str (git-snapshot/prune repo false)))))
+    (is (not (str/includes? (with-out-str (git-snapshot/list-snapshots repo)) "prune")) "hint gone")
     (fs/delete-tree repo)))
 
 (let [{:keys [fail error]} (run-tests)]

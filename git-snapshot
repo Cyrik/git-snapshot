@@ -29,7 +29,10 @@
   "usage: git snapshot [list] [--all]
        git snapshot save <name> [message...]
        git snapshot replay <name>
-       git snapshot delete <name>")
+       git snapshot delete <name>
+       git snapshot prune [--dry-run]")
+
+(def flags #{"--all" "--dry-run" "-n" "-h" "--help"})
 
 (def nul-separator (re-pattern (str (char 0))))
 
@@ -192,11 +195,15 @@
                 (zipmap (git-lines repo "rev-list" (:sha tip)) (range)))]
     (sort-by #(get order (:sha %) Long/MAX_VALUE) entries)))
 
+(declare print-prune-hint)
+
 (defn list-snapshots
-  "Snapshots on the current branch."
+  "Snapshots on the current branch, with a hint when other branches' snapshots
+  are ready to prune."
   [repo]
   (let [prefix (branch-prefix repo)]
     (print-entries (chain-ordered repo (snapshot-entries repo prefix) prefix) prefix))
+  (print-prune-hint repo)
   (flush))
 
 (defn snapshot-branch
@@ -210,16 +217,111 @@
          (filter branches)
          first)))
 
+(defn local-branches [repo]
+  (set (git-lines repo "for-each-ref" "--format=%(refname:lstrip=2)" "refs/heads/")))
+
+(defn snapshot-groups
+  "All snapshots grouped by branch as [branch entries] pairs, sorted by branch
+  name with unattributable refs (nil branch) last."
+  [repo]
+  (let [branches (local-branches repo)]
+    (sort-by (fn [[branch]] [(nil? branch) (or branch "")])
+             (group-by #(snapshot-branch branches (:ref %)) (snapshot-entries repo ref-prefix)))))
+
+(defn default-branch-ref
+  "The default branch as a full ref: origin/HEAD's target when the remote
+  advertises one, else a local main or master. nil when none exists."
+  [repo]
+  (let [{:keys [exit out]} (p/shell {:dir repo :out :string :continue true}
+                                    "git" "symbolic-ref" "-q" "refs/remotes/origin/HEAD")]
+    (if (zero? exit)
+      (str/trim out)
+      (some #(when (resolve-ref repo %) %) ["refs/heads/main" "refs/heads/master"]))))
+
+(defn branch-name [ref]
+  (str/replace ref #"^refs/(heads|remotes/[^/]+)/" ""))
+
+(defn config-value [repo key]
+  (let [{:keys [exit out]} (p/shell {:dir repo :out :string :continue true} "git" "config" "--get" key)]
+    (when (zero? exit) (str/trim out))))
+
+(defn upstream-gone?
+  "The branch tracks a remote branch that no longer exists: what a squash-merged
+  pull request looks like once the hosting side deleted its branch."
+  [repo branch]
+  (let [remote (config-value repo (str "branch." branch ".remote"))
+        merge (config-value repo (str "branch." branch ".merge"))]
+    (boolean (and remote merge (not= remote ".")
+                  (nil? (resolve-ref repo (str "refs/remotes/" remote "/" (branch-name merge))))))))
+
+(defn checked-out-branches
+  "Branches checked out in any worktree of the repo."
+  [repo]
+  (->> (git-lines repo "worktree" "list" "--porcelain")
+       (keep #(second (re-matches #"branch refs/heads/(.+)" %)))
+       set))
+
+(defn finished-branch?
+  "A branch whose work is over: deleted locally, or neither checked out in any
+  worktree nor the default branch, and either upstream gone or merged into the
+  default branch. Merged means an ancestor of the default branch with a
+  different tip. A branch that is checked out anywhere is never finished: a
+  fresh branch with no commits of its own looks exactly like a fast-forwarded
+  one once the default branch moves on, and its pre-commit snapshots must
+  survive while someone is on it."
+  [repo default-ref checked-out branch]
+  (let [head-ref (str "refs/heads/" branch)
+        tip (resolve-ref repo head-ref)]
+    (cond
+      (nil? tip) true
+      (checked-out branch) false
+      (and default-ref (= branch (branch-name default-ref))) false
+      (upstream-gone? repo branch) true
+      default-ref (and (not= tip (resolve-ref repo default-ref))
+                       (zero? (:exit (p/shell {:dir repo :out :string :continue true}
+                                              "git" "merge-base" "--is-ancestor" head-ref default-ref))))
+      :else false)))
+
+(defn prunable-groups
+  "Snapshot groups whose branch is finished, plus refs attributable to no branch
+  (saved before branch namespacing, or whose branch was deleted)."
+  [repo]
+  (let [default-ref (default-branch-ref repo)
+        checked-out (checked-out-branches repo)]
+    (filter (fn [[branch]] (or (nil? branch) (finished-branch? repo default-ref checked-out branch)))
+            (snapshot-groups repo))))
+
+(defn print-prune-hint [repo]
+  (let [n (reduce + (map (comp count second) (prunable-groups repo)))]
+    (when (pos? n)
+      (println (str n " snapshot" (when (not= 1 n) "s") " on finished branches: git snapshot prune")))))
+
 (defn list-all-snapshots
   "Every snapshot in the repo, grouped by branch, unattributable refs last."
   [repo]
-  (let [branches (set (git-lines repo "for-each-ref" "--format=%(refname:lstrip=2)" "refs/heads/"))
-        groups (group-by #(snapshot-branch branches (:ref %)) (snapshot-entries repo ref-prefix))]
-    (doseq [[branch entries] (sort-by (fn [[branch]] [(nil? branch) (or branch "")]) groups)]
-      (let [prefix (if branch (str ref-prefix branch "/") ref-prefix)]
-        (println (str "[" (or branch "no branch") "]"))
-        (print-entries (chain-ordered repo entries prefix) prefix))))
+  (doseq [[branch entries] (snapshot-groups repo)]
+    (let [prefix (if branch (str ref-prefix branch "/") ref-prefix)]
+      (println (str "[" (or branch "no branch") "]"))
+      (print-entries (chain-ordered repo entries prefix) prefix)))
+  (print-prune-hint repo)
   (flush))
+
+(defn prune
+  "Delete every snapshot of a finished branch (see `finished-branch?`), and
+  every ref attributable to no branch. Snapshots on live or checked-out
+  branches stay.
+  Deleted refs have no reflog, so the commits become collectable by gc."
+  [repo dry-run?]
+  (let [groups (prunable-groups repo)]
+    (if (empty? groups)
+      (println "nothing to prune")
+      (doseq [[branch entries] groups]
+        (println (str (if dry-run? "would delete " "deleted ") (count entries)
+                      " under [" (or branch "no branch") "]"))
+        (when-not dry-run?
+          (doseq [{:keys [ref]} entries]
+            (git repo "update-ref" "-d" ref)))))
+    (flush)))
 
 (defn dirty? [repo]
   (not (str/blank? (git repo "status" "--porcelain"))))
@@ -274,11 +376,12 @@
 
 (defn -main [args]
   (let [repo (git "." "rev-parse" "--show-toplevel")
-        all? (some #{"--all"} args)
-        [command name & message] (remove #{"--all"} args)]
+        given (set (filter flags args))
+        [command name & message] (remove flags args)]
     (cond
-      (or (nil? command) (= "list" command)) (if all? (list-all-snapshots repo) (list-snapshots repo))
-      (#{"-h" "--help"} command) (println usage)
+      (or (given "-h") (given "--help")) (println usage)
+      (or (nil? command) (= "list" command)) (if (given "--all") (list-all-snapshots repo) (list-snapshots repo))
+      (= "prune" command) (prune repo (boolean (or (given "--dry-run") (given "-n"))))
       (nil? name) (fail usage)
       (= "save" command) (save repo name (when (seq message) (str/join " " message)))
       (= "replay" command) (replay repo name)
