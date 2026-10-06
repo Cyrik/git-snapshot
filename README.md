@@ -51,7 +51,7 @@ git snapshot [list] [--all]           this branch's snapshots; --all groups ever
 git snapshot save <name> [message...] snapshot the working tree
 git snapshot replay <name>            make the working tree match a snapshot
 git snapshot delete <name>
-git snapshot prune [--dry-run]        delete the snapshots of finished branches
+git snapshot prune [-n|--dry-run]     delete the snapshots of finished branches
 ```
 
 Names resolve on the current branch first, then as a full path under
@@ -61,8 +61,8 @@ the path before the name is the branch.
 
 ## Replay
 
-`replay` uses `git restore --source=<snapshot> --worktree`, then removes
-untracked files the snapshot does not contain. The index is never touched, so
+`replay` removes untracked files the snapshot does not contain, then runs
+`git restore --source=<snapshot> --worktree`. The index is never touched, so
 the snapshot's changes appear as unstaged modifications and untracked files,
 which is what a diff viewer wants. If the working tree is dirty, it is saved
 first as `pre-replay-<timestamp>`; replay that name to get back. Replay decides
@@ -86,6 +86,10 @@ git config --add snapshot.exclude ':(glob)**/notes.md'   # per repo, any depth
 Pathspec syntax, relative to the repo root. Only untracked matches are
 dropped; a tracked file matching a pattern is snapshotted normally, and replay
 leaves excluded files alone.
+
+A nested repository that is not a submodule is not a file: whatever the
+patterns say, a snapshot records it as a gitlink, as `git add` would, and
+replay never deletes it.
 
 Tracked files with a local edit you never commit (an editor settings file, a
 hook switched off on one machine) can carry git's skip-worktree bit instead:
@@ -149,6 +153,9 @@ anyone committing.
   with no stack trace.
 - Not a filesystem backup. Empty directories, ignored files, and permissions
   beyond the executable bit are not captured.
+- Every skip-worktree path is passed to git as an argument. A sparse checkout
+  with tens of thousands of them exceeds the operating system's argument length
+  limit, and save and replay fail.
 
 ## Development
 

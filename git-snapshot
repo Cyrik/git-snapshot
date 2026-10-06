@@ -30,7 +30,7 @@
        git snapshot save <name> [message...]
        git snapshot replay <name>
        git snapshot delete <name>
-       git snapshot prune [--dry-run]")
+       git snapshot prune [-n|--dry-run]")
 
 (def known-flags #{"--all" "--dry-run" "-n" "-h" "--help"})
 
@@ -79,10 +79,13 @@
 (defn resolve-snapshot
   "Resolve `name` on the current branch first, then as a full path under
   refs/snapshots/ (another branch's snapshot, or one saved before branch
-  namespacing). Returns {:ref :sha} or nil."
+  namespacing). A name containing `/` can only be a full path. Returns
+  {:ref :sha} or nil."
   [repo name]
   (some (fn [ref] (when-let [sha (resolve-ref repo ref)] {:ref ref :sha sha}))
-        [(snapshot-ref repo name) (str ref-prefix name)]))
+        (if (str/includes? name "/")
+          [(str ref-prefix name)]
+          [(snapshot-ref repo name) (str ref-prefix name)])))
 
 (defn display-name [ref prefix]
   (subs ref (count prefix)))
@@ -124,6 +127,15 @@
   (let [prefix (branch-prefix repo)]
     (chain-tip (branch-entries repo prefix) prefix)))
 
+(defn untracked-files
+  "Untracked, non-ignored files under the ignore rules currently in the
+  working tree, limited to `pathspecs` when given. A nested repository shows
+  up as `dir/` and is left out: it is not a file, so it is neither excluded
+  nor deleted, and `add -A` records it as a gitlink like plain git does."
+  [repo & pathspecs]
+  (remove #(str/ends-with? % "/")
+          (apply git-nul-list repo "ls-files" "--others" "--exclude-standard" "-z" "--" pathspecs)))
+
 (defn excluded-untracked
   "Untracked files matching the pathspecs in the multi-valued git config
   `snapshot.exclude`. They are left out of snapshots and left alone by replay,
@@ -135,7 +147,7 @@
                                     "git" "config" "--get-all" "snapshot.exclude")
         patterns (when (zero? exit) (remove str/blank? (str/split-lines out)))]
     (when (seq patterns)
-      (apply git-nul-list repo "ls-files" "--others" "--exclude-standard" "-z" "--" patterns))))
+      (apply untracked-files repo patterns))))
 
 (defn skip-worktree-paths
   "Tracked paths whose index entry carries the skip-worktree bit, set with
@@ -156,10 +168,13 @@
   unborn branch) before `add -A`: ignore rules only filter untracked files, so
   a tracked file that also matches .gitignore stays in the snapshot instead of
   reading as deleted. After `add -A`, `excluded` paths are dropped again and
-  `at-head` paths are reset to their `head` entry, which drops one `head` lacks."
+  `at-head` paths are reset to their `head` entry, which drops one `head` lacks.
+  Both hold file names, never patterns, so pathspec globbing is off for every
+  call here: `x[1].txt` must not reach `x1.txt`."
   [repo head excluded at-head]
   (let [tmp (fs/create-temp-dir)
-        env {"GIT_INDEX_FILE" (str (fs/path tmp "index"))}]
+        env {"GIT_INDEX_FILE" (str (fs/path tmp "index"))
+             "GIT_LITERAL_PATHSPECS" "1"}]
     (try
       (when head
         (p/shell {:dir repo :extra-env env :out :string} "git" "read-tree" head))
@@ -170,6 +185,15 @@
         (apply p/shell {:dir repo :extra-env env :out :string} "git" "reset" "-q" head "--" at-head))
       (str/trim (:out (p/shell {:dir repo :extra-env env :out :string} "git" "write-tree")))
       (finally (fs/delete-tree tmp)))))
+
+(defn worktree-tree
+  "Tree object of the working tree as a snapshot records it, see
+  `write-worktree-tree`. `head` is HEAD's sha, nil on an unborn branch."
+  [repo head]
+  (write-worktree-tree repo head (excluded-untracked repo) (skip-worktree-paths repo)))
+
+(defn empty-tree [repo]
+  (git repo "hash-object" "-t" "tree" "/dev/null"))
 
 (defn save
   "Store the working tree as refs/snapshots/<branch>/<name> and return the
@@ -186,10 +210,10 @@
         head (resolve-ref repo "HEAD")
         chain (when-not (backup-name? name) (chain-parent repo))
         parent (or (:sha chain) head)
-        tree (write-worktree-tree repo head (excluded-untracked repo) (skip-worktree-paths repo))
+        tree (worktree-tree repo head)
         sha (apply git repo "commit-tree" tree
                    (concat (when parent ["-p" parent]) ["-m" (or message (str "snapshot " name))]))
-        base (or head (git repo "hash-object" "-t" "tree" "/dev/null"))]
+        base (or head (empty-tree repo))]
     (git repo "update-ref" ref sha)
     (println (str name " " (subs sha 0 12)
                   (when chain (str " (after " (display-name (:ref chain) prefix) ")"))
@@ -204,10 +228,12 @@
 
 (defn chain-ordered
   "Entries in chain order (tip first, like `git log`), then anything off the
-  chain, newest first."
+  chain, newest first. The walk stops at commits a branch or remote owns, so
+  it visits the snapshots and not the branch's history."
   [repo entries prefix]
   (let [order (when-let [tip (chain-tip entries prefix)]
-                (zipmap (git-lines repo "rev-list" (:sha tip)) (range)))]
+                (zipmap (git-lines repo "rev-list" (:sha tip) "--not" "--branches" "--remotes")
+                        (range)))]
     (sort-by #(get order (:sha %) Long/MAX_VALUE) entries)))
 
 (defn snapshot-branch
@@ -334,29 +360,25 @@
     (flush)))
 
 (defn dirty?
-  "Whether the working tree differs from HEAD or holds untracked files. Asks
-  for untracked files explicitly so `status.showUntrackedFiles=no` cannot
-  hide them."
+  "Whether a snapshot of the working tree would differ from HEAD. Decided from
+  the tree a snapshot records rather than from `git status`, whose view is
+  narrowed by status.showUntrackedFiles and the assume-unchanged bit."
   [repo]
-  (not (str/blank? (git repo "status" "--porcelain" "--untracked-files=normal"))))
+  (let [head (resolve-ref repo "HEAD")]
+    (not= (worktree-tree repo head)
+          (if head (git repo "rev-parse" (str head "^{tree}")) (empty-tree repo)))))
 
 (defn timestamp []
   (.format (LocalDateTime/now) (DateTimeFormatter/ofPattern "yyyyMMdd-HHmmss")))
 
-(defn untracked-files
-  "Untracked, non-ignored files under the ignore rules currently in the
-  working tree. A nested repository shows up as `dir/` and is left out."
-  [repo]
-  (remove #(str/ends-with? % "/")
-          (git-nul-list repo "ls-files" "--others" "--exclude-standard" "-z")))
-
 (defn stray-untracked
   "Untracked files the snapshot does not contain, minus `snapshot.exclude`
   matches. `git restore` never removes untracked files, so replay deletes
-  these itself to make the working tree match the snapshot. Must run before
-  the restore: afterwards the snapshot's ignore rules are in effect, and a
-  file they do not ignore could be deleted without the backup, taken under
-  the current rules, having captured it."
+  these itself to make the working tree match the snapshot. Replay lists and
+  deletes them before the restore, while the working tree is still the one
+  the backup captured: afterwards the snapshot's ignore rules decide what is
+  untracked, and a stray's path may run through a symlink or file the
+  snapshot put in place."
   [repo ref]
   (let [keep (into (set (git-nul-list repo "ls-tree" "-r" "--name-only" "-z" ref))
                    (excluded-untracked repo))]
@@ -383,10 +405,10 @@
       (let [backup (unique-name repo (str backup-prefix (timestamp)))]
         (save repo backup (str "working tree before replaying " name))
         (println "saved current working tree as" backup)))
-    (apply git repo "restore" "--source" ref "--worktree" "--" ":/"
-           (map #(str ":(exclude,literal)" %) (skip-worktree-paths repo)))
     (doseq [file strays]
       (fs/delete (fs/path repo file)))
+    (apply git repo "restore" "--source" ref "--worktree" "--" ":/"
+           (map #(str ":(exclude,literal)" %) (skip-worktree-paths repo)))
     (print (:out (p/shell {:dir repo :out :string} "git" "status" "--short")))
     (flush)))
 
@@ -408,17 +430,19 @@
     {:flags (set (concat leading-flags more-flags)) :command command :name name :message message}))
 
 (defn -main [args]
-  (let [repo (git "." "rev-parse" "--show-toplevel")
-        {:keys [flags command name message]} (parse-args args)]
-    (cond
-      (or (flags "-h") (flags "--help")) (println usage)
-      (or (nil? command) (= "list" command)) (if (flags "--all") (list-all-snapshots repo) (list-snapshots repo))
-      (= "prune" command) (prune repo (boolean (or (flags "--dry-run") (flags "-n"))))
-      (nil? name) (fail usage)
-      (= "save" command) (save repo name (when (seq message) (str/join " " message)))
-      (= "replay" command) (replay repo name)
-      (= "delete" command) (delete repo name)
-      :else (fail usage))))
+  (let [{:keys [flags command name message]} (parse-args args)]
+    (if (or (flags "-h") (flags "--help"))
+      (println usage)
+      (let [repo (git "." "rev-parse" "--show-toplevel")
+            subject (when-not (every? str/blank? message) (str/join " " message))]
+        (cond
+          (or (nil? command) (= "list" command)) (if (flags "--all") (list-all-snapshots repo) (list-snapshots repo))
+          (= "prune" command) (prune repo (boolean (or (flags "--dry-run") (flags "-n"))))
+          (nil? name) (fail usage)
+          (= "save" command) (save repo name subject)
+          (= "replay" command) (replay repo name)
+          (= "delete" command) (delete repo name)
+          :else (fail usage))))))
 
 (when (= *file* (System/getProperty "babashka.file"))
   (try (-main *command-line-args*)

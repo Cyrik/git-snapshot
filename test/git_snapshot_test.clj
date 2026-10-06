@@ -82,6 +82,11 @@
 (defn dry-run [repo]
   (with-out-str (git-snapshot/prune repo true)))
 
+(defn run-script
+  "Run the script as `git snapshot` would, in `dir`; returns the process map."
+  [dir & args]
+  (apply p/shell {:dir dir :out :string :err :string :continue true} "bb" script args))
+
 (deftest save-captures-worktree-under-branch-without-touching-index
   (let [repo (temp-repo)]
     (dirty-worktree! repo)
@@ -568,16 +573,113 @@
 
 (deftest git-failures-exit-without-a-stack-trace
   (let [repo (temp-repo)
-        run (fn [dir & args]
-              (apply p/shell {:dir dir :out :string :err :string :continue true} "bb" script args))
-        bad-name (run repo "save" "bad name")
-        outside (run (str (fs/create-temp-dir)) "list")]
+        bad-name (run-script repo "save" "bad name")
+        outside (run-script (str (fs/create-temp-dir)) "list")]
     (is (= 1 (:exit bad-name)))
     (is (str/includes? (:err bad-name) "bad name") "git's own message is shown")
     (is (not (str/includes? (:err bad-name) "----- Error")) "no Babashka error report")
     (is (= 1 (:exit outside)))
     (is (str/includes? (:err outside) "not a git repository"))
     (is (not (str/includes? (:err outside) "----- Error")))
+    (fs/delete-tree repo)))
+
+(deftest replay-backs-up-assume-unchanged-edits
+  ;; git status hides a file marked assume-unchanged, but save records its
+  ;; content, so replay must back it up before overwriting it.
+  (let [repo (temp-repo)]
+    (commit-file! repo "settings.cfg" "cfg=1\n" "settings")
+    (quiet #(git-snapshot/save repo "s1" nil))
+    (git repo "update-index" "--assume-unchanged" "settings.cfg")
+    (spit (fs/file repo "settings.cfg") "cfg=LOCAL\n")
+    (is (str/blank? (git repo "status" "--porcelain")) "status hides the edit")
+    (is (git-snapshot/dirty? repo))
+    (quiet #(git-snapshot/replay repo "s1"))
+    (is (= "cfg=1\n" (slurp (fs/file repo "settings.cfg"))))
+    (let [[backup :as backups] (filter git-snapshot/backup-name? (branch-names repo))]
+      (is (= 1 (count backups)))
+      (is (= "cfg=LOCAL" (git repo "show" (str (ref-of repo backup) ":settings.cfg")))))
+    (fs/delete-tree repo)))
+
+(deftest glob-characters-in-protected-names-do-not-reach-siblings
+  ;; Skip-worktree and excluded paths are file names. Passed to git as
+  ;; pathspecs, x[1].txt would also match x1.txt.
+  (let [repo (temp-repo)]
+    (commit-file! repo "x[1].txt" "one\n" "bracket")
+    (commit-file! repo "x1.txt" "one\n" "sibling")
+    (git repo "update-index" "--skip-worktree" "x[1].txt")
+    (spit (fs/file repo "x1.txt") "one-MODIFIED\n")
+    (spit (fs/file repo "n[1].md") "note\n")
+    (spit (fs/file repo "n1.md") "note\n")
+    (git repo "config" "snapshot.exclude" ":(literal)n[1].md")
+    (quiet #(git-snapshot/save repo "s1" nil))
+    (is (= "one-MODIFIED" (git repo "show" (str (ref-of repo "s1") ":x1.txt"))) "tracked sibling keeps its edit")
+    (is (contains? (snapshot-files repo "s1") "n1.md") "untracked sibling is not excluded")
+    (is (not (contains? (snapshot-files repo "s1") "n[1].md")) "the excluded file itself is")
+    (fs/delete-tree repo)))
+
+(deftest slash-names-resolve-as-full-paths-only
+  (let [repo (temp-repo)]
+    (git repo "checkout" "-q" "-b" "x")
+    (spit (fs/file repo "m.txt") "x\n")
+    (quiet #(git-snapshot/save repo "s1" nil))
+    (git repo "checkout" "-q" "-b" "feat/x")
+    (spit (fs/file repo "m.txt") "feat-x\n")
+    (quiet #(git-snapshot/save repo "s1" nil))
+    (git repo "checkout" "-q" "main")
+    (git repo "branch" "-q" "-D" "feat/x")
+    (git repo "checkout" "-q" "-b" "feat")
+    (is (= "refs/snapshots/x/s1" (ref-of repo "x/s1")) "not the leftover feat/x/s1")
+    (quiet #(git-snapshot/delete repo "x/s1"))
+    (is (= #{"feat/x/s1"} (all-snapshot-refs repo)))
+    (fs/delete-tree repo)))
+
+(deftest replay-deletes-strays-before-the-snapshot-reshapes-their-paths
+  ;; The snapshot has a symlink and a file where the worktree now has
+  ;; directories holding strays. Deleting after the restore would run through
+  ;; the symlink and out of the repository.
+  (let [repo (temp-repo)
+        outside (str (fs/create-temp-dir))]
+    (spit (fs/file outside "f") "precious\n")
+    (fs/create-sym-link (fs/path repo "link") outside)
+    (spit (fs/file repo "foo") "file\n")
+    (quiet #(git-snapshot/save repo "s1" nil))
+    (fs/delete (fs/path repo "link"))
+    (fs/create-dirs (fs/path repo "link"))
+    (spit (fs/file repo "link" "f") "stray\n")
+    (fs/delete (fs/path repo "foo"))
+    (fs/create-dirs (fs/path repo "foo"))
+    (spit (fs/file repo "foo" "bar") "stray\n")
+    (quiet #(git-snapshot/replay repo "s1"))
+    (is (= "precious\n" (slurp (fs/file outside "f"))) "nothing deleted through the symlink")
+    (is (fs/sym-link? (fs/path repo "link")))
+    (is (= "file\n" (slurp (fs/file repo "foo"))))
+    (is (not (fs/exists? (fs/path repo "foo" "bar"))))
+    (fs/delete-tree repo)
+    (fs/delete-tree outside)))
+
+(deftest exclude-pattern-matching-a-nested-repository-still-saves
+  (let [repo (temp-repo)]
+    (git repo "config" "snapshot.exclude" "nested")
+    (git repo "config" "advice.addEmbeddedRepo" "false")
+    (let [nested (str (fs/path repo "nested"))]
+      (git repo "init" "-q" "-b" "main" nested)
+      (configure-user! nested)
+      (commit-file! nested "x.txt" "x\n" "nested"))
+    (quiet #(git-snapshot/save repo "s1" nil))
+    (is (str/starts-with? (git repo "ls-tree" (ref-of repo "s1") "nested") "160000 commit")
+        "recorded as a gitlink, as git add does")
+    (fs/delete-tree repo)))
+
+(deftest help-works-outside-a-repository
+  (let [{:keys [exit out]} (run-script (str (fs/create-temp-dir)) "-h")]
+    (is (zero? exit))
+    (is (str/includes? out "usage: git snapshot"))))
+
+(deftest empty-message-falls-back-to-the-default-subject
+  (let [repo (temp-repo)]
+    (spit (fs/file repo "b.txt") "b\n")
+    (is (zero? (:exit (run-script repo "save" "s1" ""))))
+    (is (= "snapshot s1" (git repo "log" "-1" "--format=%s" (ref-of repo "s1"))))
     (fs/delete-tree repo)))
 
 (let [{:keys [fail error]} (run-tests)]
