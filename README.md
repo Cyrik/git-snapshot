@@ -95,21 +95,23 @@ HEAD's version and replay leaves the working copy alone, matching how
 Snapshots are cheap, roughly the size of their diff, but they are reachable,
 so `git gc` never removes them and finished branches leave their snapshots
 behind. `git snapshot prune` deletes the snapshots of every finished branch:
-one that was deleted locally, whose upstream is gone (how a squash-merged pull
-request looks after the hosting side deleted the branch), or that is merged
-into the default branch. Snapshots on the default branch and on any branch
-checked out in a worktree are never pruned, so a fresh branch that has not
-committed yet keeps its snapshots while you are on it. Refs saved before
-branch namespacing count as finished.
+one that was deleted locally, whose upstream git reports as gone (how a
+squash-merged pull request looks after the hosting side deleted the branch),
+or that is merged into the default branch. Snapshots on the default branch and
+on anything checked out in a worktree, including an unborn branch or a
+detached HEAD, are never pruned, so a fresh branch that has not committed yet
+keeps its snapshots while you are on it. Refs saved before branch namespacing
+count as finished. The default branch is whatever `origin/HEAD` points at when
+that still exists, otherwise a local `main` or `master`.
 
 ```bash
 git snapshot prune --dry-run   # show what would go
 git snapshot prune
 ```
 
-`git snapshot` prints a one-line hint when there is something to prune.
-Deleted refs have no reflog, so the commits become collectable by the next
-`git gc` once its expiry passes.
+`git snapshot` prints a one-line hint on stderr when there is something to
+prune, so the listing itself stays parseable. Deleted refs have no reflog, so
+the commits become collectable by the next `git gc` once its expiry passes.
 
 ## For AI agents
 

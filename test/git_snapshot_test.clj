@@ -12,14 +12,22 @@
 (defn quiet [f]
   (binding [*out* (java.io.StringWriter.)] (f)))
 
+(defn with-err-str [f]
+  (let [w (java.io.StringWriter.)]
+    (binding [*err* w] (f))
+    (str w)))
+
+(defn configure-user! [repo]
+  (git repo "config" "user.email" "test@example.com")
+  (git repo "config" "user.name" "test"))
+
 (defn temp-repo
   "Repo on branch `main` with one commit: a.txt, gone.txt, and a .gitignore
   that ignores *.log."
   []
   (let [repo (str (fs/create-temp-dir))]
     (git repo "init" "-q" "-b" "main")
-    (git repo "config" "user.email" "test@example.com")
-    (git repo "config" "user.name" "test")
+    (configure-user! repo)
     (spit (fs/file repo "a.txt") "a\n")
     (spit (fs/file repo "gone.txt") "gone\n")
     (spit (fs/file repo ".gitignore") "*.log\n")
@@ -35,6 +43,21 @@
   (spit (fs/file repo "new.txt") "new\n")
   (spit (fs/file repo "x.log") "ignored\n"))
 
+(defn commit-file! [repo path content message]
+  (spit (fs/file repo path) content)
+  (git repo "add" path)
+  (git repo "commit" "-q" "-m" message))
+
+(defn add-origin!
+  "Give the repo a bare origin with main pushed, so upstream tracking works.
+  Returns the bare repo's path."
+  [repo]
+  (let [bare (str (fs/path (fs/create-temp-dir) "origin.git"))]
+    (git repo "init" "-q" "--bare" bare)
+    (git repo "remote" "add" "origin" bare)
+    (git repo "push" "-q" "-u" "origin" "main")
+    bare))
+
 (defn ref-of [repo name]
   (:ref (git-snapshot/resolve-snapshot repo name)))
 
@@ -46,11 +69,20 @@
        (remove str/blank?)
        (map #(first (str/split % #"\t")))))
 
+(defn all-snapshot-refs [repo]
+  (set (git-snapshot/git-lines repo "for-each-ref" "--format=%(refname:lstrip=2)" "refs/snapshots/")))
+
 (defn snapshot-files [repo name]
   (set (str/split-lines (git repo "ls-tree" "-r" "--name-only" (ref-of repo name)))))
 
 (defn parent-of [repo name]
   (git repo "rev-parse" (str (ref-of repo name) "^")))
+
+(defn dry-run [repo]
+  (with-out-str (git-snapshot/prune repo true)))
+
+(defn list-hint [repo]
+  (with-err-str #(quiet (fn [] (git-snapshot/list-snapshots repo)))))
 
 (deftest save-captures-worktree-under-branch-without-touching-index
   (let [repo (temp-repo)]
@@ -133,27 +165,6 @@
             "first backup content unchanged")))
     (fs/delete-tree repo)))
 
-(deftest tracked-but-ignored-files-survive-save-and-replay
-  (let [repo (temp-repo)]
-    ;; Track a file first, ignore its directory afterwards: the scarlet repo's
-    ;; .clj-kondo/config.edn situation.
-    (fs/create-dirs (fs/file repo ".clj-kondo"))
-    (spit (fs/file repo ".clj-kondo/config.edn") "{}\n")
-    (git repo "add" "-A")
-    (git repo "commit" "-q" "-m" "kondo")
-    (spit (fs/file repo ".gitignore") "*.log\n.clj-kondo/\n")
-    (git repo "add" ".gitignore")
-    (git repo "commit" "-q" "-m" "ignore kondo")
-    (spit (fs/file repo "a.txt") "a\nb\n")
-    (quiet #(git-snapshot/save repo "s1" nil))
-    (is (contains? (snapshot-files repo "s1") ".clj-kondo/config.edn"))
-    (is (= ["a.txt"] (str/split-lines (git repo "diff" "--name-only" "HEAD" (ref-of repo "s1"))))
-        "only the real change shows up")
-    (git repo "checkout" "--" ".")
-    (quiet #(git-snapshot/replay repo "s1"))
-    (is (fs/exists? (fs/file repo ".clj-kondo/config.edn")) "replay leaves the tracked ignored file alone")
-    (fs/delete-tree repo)))
-
 (deftest replay-on-clean-worktree-creates-no-backup
   (let [repo (temp-repo)]
     (dirty-worktree! repo)
@@ -183,10 +194,11 @@
       (is (str/starts-with? current "f1\t"))
       (is (not (str/includes? current "s1")))
       (is (not (str/includes? current "legacy")))
-      (is (= ["[feature/x]" "f1" "[main]" "s1" "[no branch]" "legacy"
-              "1 snapshot on finished branches: git snapshot prune"]
-             (map #(first (str/split % #"\t")) (str/split-lines all)))
-          "feature/x has no commits of its own yet, so only the legacy ref is prunable"))
+      (is (not (str/includes? current "prune")) "the hint goes to stderr, not into the listing")
+      (is (= ["[feature/x]" "f1" "[main]" "s1" "[no branch]" "legacy"]
+             (map #(first (str/split % #"\t")) (str/split-lines all)))))
+    (is (= "1 snapshot on finished branches: git snapshot prune" (str/trim (list-hint repo)))
+        "only the legacy ref is prunable: feature/x is checked out, main is the default")
     (is (= "refs/snapshots/legacy" (ref-of repo "legacy")) "flat refs resolve by full path")
     (is (= "refs/snapshots/main/s1" (ref-of repo "main/s1")) "other branches resolve by full path")
     (fs/delete-tree repo)))
@@ -200,11 +212,31 @@
     (is (= "refs/snapshots/detached/d1" (ref-of repo "d1")))
     (fs/delete-tree repo)))
 
+(deftest tracked-but-ignored-files-survive-save-and-replay
+  (let [repo (temp-repo)]
+    ;; Track a file first, ignore its directory afterwards: the scarlet repo's
+    ;; .clj-kondo/config.edn situation.
+    (fs/create-dirs (fs/file repo ".clj-kondo"))
+    (spit (fs/file repo ".clj-kondo/config.edn") "{}\n")
+    (git repo "add" "-A")
+    (git repo "commit" "-q" "-m" "kondo")
+    (spit (fs/file repo ".gitignore") "*.log\n.clj-kondo/\n")
+    (git repo "add" ".gitignore")
+    (git repo "commit" "-q" "-m" "ignore kondo")
+    (spit (fs/file repo "a.txt") "a\nb\n")
+    (quiet #(git-snapshot/save repo "s1" nil))
+    (is (contains? (snapshot-files repo "s1") ".clj-kondo/config.edn"))
+    (is (= ["a.txt"] (str/split-lines (git repo "diff" "--name-only" "HEAD" (ref-of repo "s1"))))
+        "only the real change shows up")
+    (git repo "checkout" "--" ".")
+    (quiet #(git-snapshot/replay repo "s1"))
+    (is (fs/exists? (fs/file repo ".clj-kondo/config.edn")) "replay leaves the tracked ignored file alone")
+    (fs/delete-tree repo)))
+
 (deftest unborn-branch-gets-a-parentless-first-snapshot
   (let [repo (str (fs/create-temp-dir))]
     (git repo "init" "-q" "-b" "main")
-    (git repo "config" "user.email" "test@example.com")
-    (git repo "config" "user.name" "test")
+    (configure-user! repo)
     (spit (fs/file repo "a.txt") "a\n")
     (is (nil? (git-snapshot/resolve-ref repo "HEAD")) "no commits yet")
     (quiet #(git-snapshot/save repo "baseline" nil))
@@ -256,7 +288,7 @@
 (deftest skip-worktree-files-stay-at-head-and-survive-replay
   (let [repo (temp-repo)]
     ;; A committed settings file with a per-machine edit hidden by the
-    ;; skip-worktree bit, as `git skip-local add` leaves it.
+    ;; skip-worktree bit.
     (spit (fs/file repo "settings.json") "{\"hooks\": true}\n")
     (git repo "add" "settings.json")
     (git repo "commit" "-q" "-m" "settings")
@@ -307,22 +339,17 @@
       (is (= ["second" "first" "init"] (str/split-lines (git repo "log" "--format=%s" (ref-of repo "s2"))))))
     (fs/delete-tree repo)))
 
-(defn commit-file! [repo path content message]
-  (spit (fs/file repo path) content)
-  (git repo "add" path)
-  (git repo "commit" "-q" "-m" message))
-
-
 (deftest prune-removes-snapshots-of-finished-branches-only
   (let [repo (temp-repo)
-        wt (str (fs/path (fs/create-temp-dir) "parked-wt"))
-        all-refs #(set (git-snapshot/git-lines repo "for-each-ref" "--format=%(refname:lstrip=2)" "refs/snapshots/"))]
-    ;; main: the default branch, its snapshots must survive even though main
-    ;; is trivially an ancestor of itself.
+        wt-parent (str (fs/create-temp-dir))
+        wt (str (fs/path wt-parent "parked-wt"))]
+    (add-origin! repo)
+    ;; main is the default branch: its snapshot survives even when main is not
+    ;; checked out (prune runs from feature/live below).
     (spit (fs/file repo "a.txt") "a\nb\n")
     (quiet #(git-snapshot/save repo "main-s1" nil))
     (git repo "checkout" "--" ".")
-    ;; feature/merged: committed, snapshotted, merged back into main, main moved on.
+    ;; feature/merged: own commit, snapshotted, merged into main, main moved on.
     (git repo "checkout" "-q" "-b" "feature/merged")
     (commit-file! repo "merged.txt" "m\n" "merged work")
     (spit (fs/file repo "merged.txt") "m\nmore\n")
@@ -338,51 +365,135 @@
     (fs/delete (fs/file repo "d.txt"))
     (git repo "checkout" "-q" "main")
     (git repo "branch" "-D" "feature/deleted")
-    ;; feature/squash: unmerged commit, but its upstream is gone.
+    ;; feature/squash: pushed, then the remote branch deleted, so git reports
+    ;; the upstream as gone. Its commit is not in main.
     (git repo "checkout" "-q" "-b" "feature/squash")
     (commit-file! repo "sq.txt" "s\n" "squash work")
+    (git repo "push" "-q" "-u" "origin" "feature/squash")
+    (spit (fs/file repo "sq.txt") "s\nmore\n")
     (quiet #(git-snapshot/save repo "s1" nil))
-    (git repo "config" "branch.feature/squash.remote" "origin")
-    (git repo "config" "branch.feature/squash.merge" "refs/heads/feature/squash")
+    (git repo "checkout" "--" ".")
     (git repo "checkout" "-q" "main")
-    ;; feature/live: unmerged, no upstream, must survive.
+    (git repo "push" "-q" "origin" "--delete" "feature/squash")
+    ;; feature/pushed: pushed and still on the remote, unmerged: must survive.
+    (git repo "checkout" "-q" "-b" "feature/pushed")
+    (commit-file! repo "pu.txt" "p\n" "pushed work")
+    (git repo "push" "-q" "-u" "origin" "feature/pushed")
+    (spit (fs/file repo "pu.txt") "p\nmore\n")
+    (quiet #(git-snapshot/save repo "s1" nil))
+    (git repo "checkout" "--" ".")
+    (git repo "checkout" "-q" "main")
+    ;; feature/live: unmerged, no upstream: must survive.
     (git repo "checkout" "-q" "-b" "feature/live")
     (commit-file! repo "live.txt" "l\n" "live work")
     (spit (fs/file repo "live.txt") "l\nmore\n")
     (quiet #(git-snapshot/save repo "s1" nil))
     (git repo "checkout" "--" ".")
     (git repo "checkout" "-q" "main")
-    ;; feature/parked: merged, but still checked out in a worktree, so protected
-    ;; until that worktree goes. Its snapshot is taken from inside the worktree.
+    ;; feature/parked: merged and main moved on, but still checked out in a
+    ;; worktree, so protected until that worktree goes.
     (git repo "checkout" "-q" "-b" "feature/parked")
-    (commit-file! repo "parked.txt" "p\n" "parked work")
+    (commit-file! repo "parked.txt" "k\n" "parked work")
     (git repo "checkout" "-q" "main")
     (git repo "merge" "-q" "feature/parked")
     (commit-file! repo "after2.txt" "y\n" "main moves on again")
     (git repo "worktree" "add" "-q" wt "feature/parked")
-    (spit (fs/file wt "parked.txt") "p\nmore\n")
+    (spit (fs/file wt "parked.txt") "k\nmore\n")
     (quiet #(git-snapshot/save wt "s1" nil))
+    ;; feature/fresh: branched off main's current tip with no commits of its
+    ;; own, snapshotted, then left. Same tip as the default: must survive.
+    (git repo "checkout" "-q" "-b" "feature/fresh")
+    (spit (fs/file repo "fresh.txt") "f\n")
+    (quiet #(git-snapshot/save repo "s1" nil))
+    (fs/delete (fs/file repo "fresh.txt"))
     ;; a ref from before branch namespacing
-    (git repo "update-ref" "refs/snapshots/legacy" (:sha (git-snapshot/resolve-snapshot repo "main-s1")))
-    (let [before (all-refs)
-          dry (with-out-str (git-snapshot/prune repo true))]
-      (is (= before (all-refs)) "dry run deletes nothing")
+    (git repo "update-ref" "refs/snapshots/legacy" (:sha (git-snapshot/resolve-snapshot repo "main/main-s1")))
+    ;; Prune from a branch that is neither main nor any fixture under test.
+    (git repo "checkout" "-q" "feature/live")
+    (let [status (git-snapshot/branch-status repo)]
+      (is (= "main" (:default status)))
+      (is (= #{"feature/squash"} (:gone status)) "only the deleted remote branch is gone")
+      (is (= #{"feature/live" "feature/parked"} (:checked-out status))
+          "the current branch and the parked worktree; main is not checked out"))
+    (let [before (all-snapshot-refs repo)
+          dry (dry-run repo)]
+      (is (= before (all-snapshot-refs repo)) "dry run deletes nothing")
       (is (str/includes? dry "would delete 1 under [feature/merged]"))
       (is (str/includes? dry "would delete 1 under [feature/squash]"))
       (is (str/includes? dry "would delete 2 under [no branch]") "deleted branch + legacy ref")
-      (is (not (str/includes? dry "feature/live")))
-      (is (not (str/includes? dry "feature/parked")) "checked out in a worktree")
-      (is (not (str/includes? dry "[main]")))
-      (is (str/includes? (with-out-str (git-snapshot/list-snapshots repo)) "4 snapshots on finished branches")))
+      (doseq [kept ["feature/live" "feature/pushed" "feature/parked" "feature/fresh" "[main]"]]
+        (is (not (str/includes? dry kept)) kept))
+      (is (= "4 snapshots on finished branches: git snapshot prune" (str/trim (list-hint repo)))))
     (quiet #(git-snapshot/prune repo false))
-    (is (= #{"main/main-s1" "feature/live/s1" "feature/parked/s1"} (all-refs)))
+    (is (= #{"main/main-s1" "feature/pushed/s1" "feature/live/s1" "feature/parked/s1" "feature/fresh/s1"}
+           (all-snapshot-refs repo)))
     (git repo "worktree" "remove" "--force" wt)
     (is (= "deleted 1 under [feature/parked]" (str/trim (with-out-str (git-snapshot/prune repo false))))
         "once the worktree is gone the merged branch is finished")
-    (is (= #{"main/main-s1" "feature/live/s1"} (all-refs)))
     (is (= "nothing to prune" (str/trim (with-out-str (git-snapshot/prune repo false)))))
-    (is (not (str/includes? (with-out-str (git-snapshot/list-snapshots repo)) "prune")) "hint gone")
+    (is (str/blank? (list-hint repo)) "hint gone")
+    (fs/delete-tree wt-parent)
     (fs/delete-tree repo)))
+
+(deftest unborn-and-detached-snapshots-are-protected-while-checked-out
+  (let [repo (str (fs/create-temp-dir))]
+    (git repo "init" "-q" "-b" "main")
+    (configure-user! repo)
+    (spit (fs/file repo "a.txt") "a\n")
+    (quiet #(git-snapshot/save repo "baseline" nil))
+    (is (= "nothing to prune" (str/trim (dry-run repo))) "unborn main is checked out")
+    (is (str/blank? (list-hint repo)))
+    (git repo "add" "a.txt")
+    (git repo "commit" "-q" "-m" "init")
+    (git repo "checkout" "-q" "--detach")
+    (spit (fs/file repo "b.txt") "b\n")
+    (quiet #(git-snapshot/save repo "d1" nil))
+    (is (= "nothing to prune" (str/trim (dry-run repo))) "detached snapshots are protected while detached")
+    (git repo "checkout" "-q" "main")
+    (is (= "would delete 1 under [no branch]" (str/trim (dry-run repo)))
+        "back on a branch, the detached snapshots are leftovers")
+    (fs/delete-tree repo)))
+
+(deftest single-branch-clone-does-not-report-upstream-gone
+  (let [repo (temp-repo)
+        bare (add-origin! repo)
+        clone (str (fs/path (fs/create-temp-dir) "clone"))]
+    (git repo "clone" "-q" "--single-branch" "-b" "main" bare clone)
+    (configure-user! clone)
+    (git clone "checkout" "-q" "-b" "feature")
+    (commit-file! clone "f.txt" "f\n" "feature work")
+    (git clone "push" "-q" "-u" "origin" "feature")
+    (is (nil? (git-snapshot/resolve-ref clone "refs/remotes/origin/feature"))
+        "a single-branch fetch refspec never creates the tracking ref")
+    (spit (fs/file clone "f.txt") "f\nmore\n")
+    (quiet #(git-snapshot/save clone "s1" nil))
+    (git clone "checkout" "--" ".")
+    (git clone "checkout" "-q" "main")
+    (is (not (contains? (:gone (git-snapshot/branch-status clone)) "feature")))
+    (is (= "nothing to prune" (str/trim (dry-run clone))))
+    (fs/delete-tree repo)))
+
+(deftest dangling-origin-head-falls-back-to-local-default
+  (let [repo (temp-repo)]
+    (add-origin! repo)
+    (is (= "refs/heads/main" (git-snapshot/default-branch-ref repo)) "no origin/HEAD yet")
+    (git repo "symbolic-ref" "refs/remotes/origin/HEAD" "refs/remotes/origin/main")
+    (is (= "refs/remotes/origin/main" (git-snapshot/default-branch-ref repo)))
+    (git repo "symbolic-ref" "refs/remotes/origin/HEAD" "refs/remotes/origin/renamed-away")
+    (is (= "refs/heads/main" (git-snapshot/default-branch-ref repo)) "dangling origin/HEAD is ignored")
+    (is (str/blank? (with-err-str #(quiet (fn [] (git-snapshot/list-snapshots repo))))) "and nothing is printed to stderr")
+    (fs/delete-tree repo)))
+
+(deftest flags-are-parsed-only-before-the-name
+  (is (= {:flags #{"--all"} :command nil :name nil :message nil}
+         (git-snapshot/parse-args ["--all"])))
+  (is (= {:flags #{"--all"} :command "list" :name nil :message nil}
+         (git-snapshot/parse-args ["list" "--all"])))
+  (is (= {:flags #{"-n"} :command "prune" :name nil :message nil}
+         (git-snapshot/parse-args ["prune" "-n"])))
+  (is (= {:flags #{} :command "save" :name "s1" :message ["-n" "see" "--help"]}
+         (git-snapshot/parse-args ["save" "s1" "-n" "see" "--help"]))
+      "message text keeps words that look like flags"))
 
 (let [{:keys [fail error]} (run-tests)]
   (System/exit (if (zero? (+ fail error)) 0 1)))
